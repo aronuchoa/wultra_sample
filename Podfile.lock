@@ -1,0 +1,26 @@
+PODS:
+  - PowerAuth2 (1.6.2):
+    - PowerAuthCore (~> 1.6.2)
+  - PowerAuthCore (1.6.2)
+  - WultraSSLPinning/Lib (1.4.0)
+  - WultraSSLPinning/PowerAuthIntegration (1.4.0):
+    - PowerAuth2 (>= 1.6.0)
+    - WultraSSLPinning/Lib
+
+DEPENDENCIES:
+  - WultraSSLPinning/PowerAuthIntegration
+
+SPEC REPOS:
+  trunk:
+    - PowerAuth2
+    - PowerAuthCore
+    - WultraSSLPinning
+
+SPEC CHECKSUMS:
+  PowerAuth2: 18365eda20a3aaec6e1d0d92679c7e90d646cc05
+  PowerAuthCore: 733c68b8f923d49304353ac5d7871ef49f948b38
+  WultraSSLPinning: 73a73de4f89b0ac98154c3ef761ed6eee7760749
+
+PODFILE CHECKSUM: 412e2a03649e06c5905bb93b5072778dc4885883
+
+COCOAPODS: 1.10.1

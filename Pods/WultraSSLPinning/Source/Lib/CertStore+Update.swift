@@ -1,0 +1,282 @@
+//
+// Copyright 2018 Wultra s.r.o.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions
+// and limitations under the License.
+//
+
+import Foundation
+
+public extension CertStore {
+    
+    /// Defines modes of update request
+    enum UpdateMode {
+        
+        /// The default mode keeps periodicity of handling on the CertStore
+        case `default`
+        
+        /// The forced update tells the `CertStore` that is should update certificates right
+        /// now. You should use this mode only if `validate()` method returns "empty" validation
+        /// result, otherwise the `.default` is always recommended.
+        ///
+        /// Note that in "forced" mode the completion block is called always after the update
+        /// is finished.
+        case forced
+    }
+    
+    /// Result from update certificates request.
+    enum UpdateResult {
+        
+        /// Update succeeded
+        case ok
+        
+        /// The update request succeeded, but the result is still an empty list of certificates.
+        /// This may happen when the loading & validating of remote data succeeded, but all loaded
+        /// certificates are already expired.
+        case storeIsEmpty
+        
+        /// The update request failed on a network communication.
+        case networkError
+        
+        /// The update request returned an invalid data from the server.
+        case invalidData
+        
+        /// The update request returned the data which did not pass the signature validation.
+        case invalidSignature
+    }
+    
+    /// Tells `CertStore` to update its database of certificates from the remote location.
+    ///
+    /// ## Discussion
+    ///
+    /// The update operation basically works in three modes, depending on whether the database of certificates
+    /// is empty, or not.
+    /// 1. If database of certificates is empty, the the **"immediate"** update is enforced and the "completion" block
+    ///    is called after the update is finished. This basically means that the application has to wait for
+    ///    certificate fetch.
+    ///
+    /// 2. If there are some certificates, but some is expire soon, then the **"silent"** update mode is applied
+    ///    and the `completion` block is immediately scheduled to the `completionQueue` with `ok` result.
+    ///    The update of certificates is performed silently by the library. The silent update is also performed
+    ///    periodically, once per week by default.
+    ///
+    /// 3. If there are some certificates and none is closing to its expiration date, then the `completion`
+    ///    block is immediately scheduled to the `completionQueue` with `ok` result.
+    ///
+    /// - Parameter mode: Mode of update operation (`.default` is recommended)
+    /// - Parameter completionQueue: The completion queue for scheduling the completion block callback. The default is `.main`.
+    /// - Parameter completion: The completion closure called at the end of operation, with following parameters:
+    /// - Parameter result: Resut of the update operation
+    /// - Parameter error: An optional error, returned in case that operation failed on communication with the remote location.
+    func update(mode: UpdateMode = .default, completionQueue: DispatchQueue = .main, completion: @escaping (_ result: UpdateResult, _ error: Error?)->Void) -> Void {
+        
+        // Capture the current date.
+        //
+        // We'll use this date as the reference date for "now", for the whole update operation.
+        // This allows you to debug this function, just pointing the breakpoint after the date is captured.
+        // The technique also filters weird situations, when some certificate expires just during the update.
+        let now = Date()
+
+        // Acquire whole cached data structure
+        let cachedData = getCachedData()
+        
+        var needsDirectUpdate = true
+        var needsSilentUpdate = false
+        
+        if let cachedData = cachedData {
+            // Check whether there's still some valid certificate. If not, then we have to perform
+            // immediate update and application must wait for the result.
+            needsDirectUpdate = cachedData.numberOfValidCertificates(forDate: now) == 0 || mode == .forced
+            if needsDirectUpdate == false {
+                // If direct update is not required, then check whether we should perform a silent one
+                needsSilentUpdate = cachedData.nextUpdate < now
+            }
+        }
+        if needsDirectUpdate {
+            // Perform direct update and wait for the result
+            doUpdate(currentDate: now, completionQueue: completionQueue, completion: completion)
+            //
+        } else {
+            // If silent update is required, then start that update now
+            // and report "OK" result to completion queue
+            if needsSilentUpdate {
+                doUpdate(currentDate: now, completionQueue: nil, completion: nil)
+            }
+            // Returns "OK" result to the completion queue
+            completionQueue.async {
+                completion(.ok, nil)
+            }
+        }
+    }
+
+    /// Private function implemens the update operation.
+    private func doUpdate(currentDate: Date, completionQueue: DispatchQueue?, completion: ((UpdateResult, Error?)->Void)?) -> Void {
+        // Prepare challenge and request headers in case that challenge must be used
+        var requestHeaders = [String:String]()
+        let requestChallenge: String?
+        if configuration.useChallenge {
+            let randomChallenge = cryptoProvider.getRandomData(length: 16).base64EncodedString()
+            requestHeaders["X-Cert-Pinning-Challenge"] = randomChallenge
+            requestChallenge = randomChallenge
+        } else {
+            requestChallenge = nil
+        }
+        // Fetch fingerprints data from the remote data provider
+        let remoteDataRequest = RemoteDataRequest(requestHeaders: requestHeaders)
+        remoteDataProvider.getFingerprints(request: remoteDataRequest) { response in
+            let result: UpdateResult
+            let error: Error?
+            switch response.result {
+            case .success(let data):
+                result = self.processReceivedData(data, challenge: requestChallenge, responseHeaders: response.responseHeaders, currentDate: currentDate)
+                error = nil
+            case .failure(let err):
+                result = .networkError
+                error = err
+            }
+            completionQueue?.async {
+                completion?(result, error)
+            }
+        }
+    }
+    
+    /// Private function processes the received data and returns update result.
+    /// The function also updates list of cached certificates, when there's a change in the data.
+    private func processReceivedData(_ data: Data, challenge: String?, responseHeaders: [String:String], currentDate: Date) -> UpdateResult {
+        
+        // Import public key (may crash in fatalError for invalid configuration)
+        let publicKey = cryptoProvider.importECPublicKey(publicKeyBase64: configuration.publicKey)
+        
+        // Validate signature
+        if configuration.useChallenge {
+            guard let challenge = challenge else {
+                WultraDebug.fatalError("Challenge must be set")
+            }
+            guard let signature = responseHeaders["x-cert-pinning-signature"] else {
+                WultraDebug.error("CertStore: Missing signature header.")
+                return .invalidSignature
+            }
+            guard let signatureData = Data(base64Encoded: signature) else {
+                return .invalidSignature
+            }
+            var signedData = Data(challenge.utf8)
+            signedData.append(Data("&".utf8))
+            signedData.append(data)
+            guard cryptoProvider.ecdsaValidateSignatures(signedData: SignedData(data: signedData, signature: signatureData), publicKey: publicKey) else {
+                WultraDebug.error("CertStore: Invalid signature in X-Cert-Pinning-Signature header.")
+                return .invalidSignature
+            }
+        }
+        
+        // Try decode data to response object
+        guard let response = try? jsonDecoder().decode(GetFingerprintsResponse.self, from: data) else {
+            // Failed to decode JSON to our model object
+            WultraDebug.error("CertStore: Failed to parse JSON received from the server.")
+            return .invalidData
+        }
+        
+        // Try to update cached data with the newly received objects.
+        // The `updateCachedData` method guarantees atomicity of the operation.
+        var result = UpdateResult.ok
+        //
+        updateCachedData { (cachedData) -> CachedData? in
+            //
+            // This closure is called while internal thread lock is acquired.
+            //
+            var newCertificates = (cachedData?.certificates ?? []).filter { !$0.isExpired(forDate: currentDate) }
+            
+            // Iterate over all entries in the response
+            for entry in response.fingerprints {
+                // Convert entry to CI
+                let newCI = CertificateInfo(from: entry)
+                if newCI.isExpired(forDate: currentDate) {
+                    // Received entry is already expired, just skip it.
+                    continue
+                }
+                if newCertificates.firstIndex(of: newCI) != nil {
+                    // This particular entry is already in the database, just skip it.
+                    // Due to fact, that we're using the same array for newly accepted certs,
+                    // then it will also filter duplicities received from the server.
+                    continue
+                }
+                if !configuration.useChallenge {
+                    // Validate partial signature
+                    guard let signedData = entry.dataForSignatureValidation else {
+                        // Failed to construct bytes for signature validation.
+                        if entry.signature == nil {
+                            WultraDebug.error("CertStore: Missing partial signature. CN = '\(entry.name)'")
+                        } else {
+                            WultraDebug.error("CertStore: Failed to prepare data for signature validation. CN = '\(entry.name)'")
+                        }
+                        result = .invalidData
+                        break
+                    }
+                    guard cryptoProvider.ecdsaValidateSignatures(signedData: signedData, publicKey: publicKey) else {
+                        WultraDebug.error("CertStore: Invalid signature detected. CN = '\(entry.name)'")
+                        result = .invalidSignature
+                        break
+                    }
+                }
+                if let expectedCN = self.configuration.expectedCommonNames {
+                    if !expectedCN.contains(newCI.commonName) {
+                        // CertStore will store this CI, but validation will ignore this entry, due to fact, that it's not
+                        // in "expectedCommonNames" list.
+                        WultraDebug.warning("CertStore: Loaded data contains name, which will not be trusted. CN = '\(entry.name)'")
+                    }
+                }
+                // Everything looks fine, just append newCI to the list of new certificates.
+                newCertificates.append(newCI)
+            }
+            
+            /// Check whether there's at least one certificate.
+            if result == .ok && newCertificates.isEmpty {
+                // Looks like it's time to update list of certificates stored on the server.
+                WultraDebug.warning("CertStore: Database after update is still empty.")
+                result = .storeIsEmpty
+            }
+            
+            guard result == .ok else {
+                // Returning nil here means that we're not modifying cached data. This typically means
+                // that next call to "update" will force the next data load.
+                return nil
+            }
+            
+            // Sort new certificates by name & expiration date
+            newCertificates.sortCertificates()
+            
+            // Schedule the next update
+            let scheduler = UpdateScheduler(
+                periodicUpdateInterval: configuration.periodicUpdateInterval,
+                expirationUpdateTreshold: configuration.expirationUpdateTreshold,
+                thresholdMultiplier: 0.125)
+            let nextUpdate = scheduler.scheduleNextUpdate(certificates: newCertificates, currentDate: currentDate)
+            
+            // Finally, construct a new cached data.
+            return CachedData(certificates: newCertificates, nextUpdate: nextUpdate)
+        }
+        //
+        return result
+    }
+}
+
+extension CryptoProvider {
+    
+    /// Convenience method for importing EC public key from provided BASE64 string.
+    /// The function may crash on fatal error, when the key is not valid.
+    func importECPublicKey(publicKeyBase64: String) -> ECPublicKey {
+        guard let publicKeyData = Data(base64Encoded: publicKeyBase64),
+            let publicKey = importECPublicKey(publicKey: publicKeyData) else {
+                WultraDebug.fatalError("CertStoreConfiguration contains invalid public key.")
+        }
+        return publicKey
+    }
+}
